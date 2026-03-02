@@ -1,209 +1,384 @@
-package bridge
+package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"github.com/chromedp/chromedp"
+	"github.com/pinchtab/pinchtab/internal/bridge"
+	"github.com/pinchtab/pinchtab/internal/web"
+	"gopkg.in/yaml.v3"
 )
 
-type A11yNode struct {
-	Ref      string `json:"ref"`
-	Role     string `json:"role"`
-	Name     string `json:"name"`
-	Depth    int    `json:"depth"`
-	Value    string `json:"value,omitempty"`
-	Disabled bool   `json:"disabled,omitempty"`
-	Focused  bool   `json:"focused,omitempty"`
-	NodeID   int64  `json:"nodeId,omitempty"`
-}
-
-type RawAXNode struct {
-	NodeID           string      `json:"nodeId"`
-	Ignored          bool        `json:"ignored"`
-	Role             *RawAXValue `json:"role"`
-	Name             *RawAXValue `json:"name"`
-	Value            *RawAXValue `json:"value"`
-	Properties       []RawAXProp `json:"properties"`
-	ChildIDs         []string    `json:"childIds"`
-	BackendDOMNodeID int64       `json:"backendDOMNodeId"`
-}
-
-type RawAXValue struct {
-	Type  string          `json:"type"`
-	Value json.RawMessage `json:"value"`
-}
-
-type RawAXProp struct {
-	Name  string      `json:"name"`
-	Value *RawAXValue `json:"value"`
-}
-
-func (v *RawAXValue) String() string {
-	if v == nil || v.Value == nil {
-		return ""
+// HandleSnapshot returns the accessibility tree of a tab.
+//
+// @Endpoint GET /snapshot
+// @Description Returns the page structure with clickable elements, form fields, and text content
+//
+// @Param tabId string query Tab ID (required)
+// @Param filter string query Filter type: "interactive" for clickable/inputs only, "all" for everything (optional, default: "all")
+// @Param interactive bool query Alias for filter=interactive (optional)
+// @Param compact bool query Compact output (shorter ref names) (optional, default: false)
+// @Param depth int query Max nesting depth (optional, default: -1 for full tree)
+// @Param text bool query Include text content (optional, default: true)
+// @Param format string query Output format: "json" or "yaml" (optional, default: "json")
+// @Param diff bool query Include diff with previous snapshot (optional, default: false)
+// @Param output string query Write to file instead of response (optional)
+//
+// @Response 200 application/json Returns accessibility tree with refs
+// @Response 400 application/json Invalid tabId or parameters
+// @Response 404 application/json Tab not found
+//
+// @Example curl all elements:
+//
+//	curl "http://localhost:9867/snapshot?tabId=abc123"
+//
+// @Example curl interactive only:
+//
+//	curl "http://localhost:9867/snapshot?tabId=abc123&filter=interactive"
+//
+// @Example curl compact:
+//
+//	curl "http://localhost:9867/snapshot?tabId=abc123&filter=interactive&compact=true"
+//
+// @Example cli:
+//
+//	pinchtab snap -i -c
+//
+// @Example python:
+//
+//	import requests
+//	r = requests.get("http://localhost:9867/snapshot", params={"tabId": "abc123", "filter": "interactive"})
+//	tree = r.json()
+func (h *Handlers) HandleSnapshot(w http.ResponseWriter, r *http.Request) {
+	// Ensure Chrome is initialized
+	if err := h.ensureChrome(); err != nil {
+		web.Error(w, 500, fmt.Errorf("chrome initialization: %w", err))
+		return
 	}
-	var s string
-	if err := json.Unmarshal(v.Value, &s); err == nil {
-		return s
-	}
-	return strings.Trim(string(v.Value), `"`)
-}
 
-var InteractiveRoles = map[string]bool{
-	"button": true, "link": true, "textbox": true, "searchbox": true,
-	"combobox": true, "listbox": true, "option": true, "checkbox": true,
-	"radio": true, "switch": true, "slider": true, "spinbutton": true,
-	"menuitem": true, "menuitemcheckbox": true, "menuitemradio": true,
-	"tab": true, "treeitem": true,
-}
-
-const FilterInteractive = "interactive"
-
-func BuildSnapshot(nodes []RawAXNode, filter string, maxDepth int) ([]A11yNode, map[string]int64) {
-	parentMap := make(map[string]string)
-	for _, n := range nodes {
-		for _, childID := range n.ChildIDs {
-			parentMap[childID] = n.NodeID
+	tabID := r.URL.Query().Get("tabId")
+	filter := r.URL.Query().Get("filter")
+	doDiff := r.URL.Query().Get("diff") == "true"
+	format := r.URL.Query().Get("format")
+	output := r.URL.Query().Get("output")
+	outputPath := r.URL.Query().Get("path")
+	selector := r.URL.Query().Get("selector")
+	maxTokensStr := r.URL.Query().Get("maxTokens")
+	reqNoAnim := r.URL.Query().Get("noAnimations") == "true"
+	maxDepthStr := r.URL.Query().Get("depth")
+	maxDepth := -1
+	if maxDepthStr != "" {
+		if d, err := strconv.Atoi(maxDepthStr); err == nil {
+			maxDepth = d
 		}
 	}
-	depthOf := func(nodeID string) int {
-		d := 0
-		cur := nodeID
-		for {
-			p, ok := parentMap[cur]
-			if !ok {
-				break
+	maxTokens := -1
+	if maxTokensStr != "" {
+		if t, err := strconv.Atoi(maxTokensStr); err == nil && t > 0 {
+			maxTokens = t
+		}
+	}
+
+	ctx, resolvedTabID, err := h.Bridge.TabContext(tabID)
+	if err != nil {
+		web.Error(w, 404, err)
+		return
+	}
+
+	tCtx, tCancel := context.WithTimeout(ctx, h.Config.ActionTimeout)
+	defer tCancel()
+	go web.CancelOnClientDone(r.Context(), tCancel)
+
+	if reqNoAnim && !h.Config.NoAnimations {
+		bridge.DisableAnimationsOnce(tCtx)
+	}
+
+	var rawResult json.RawMessage
+	if err := chromedp.Run(tCtx,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return chromedp.FromContext(ctx).Target.Execute(ctx,
+				"Accessibility.getFullAXTree", nil, &rawResult)
+		}),
+	); err != nil {
+		web.Error(w, 500, fmt.Errorf("a11y tree: %w", err))
+		return
+	}
+
+	var treeResp struct {
+		Nodes []bridge.RawAXNode `json:"nodes"`
+	}
+	if err := json.Unmarshal(rawResult, &treeResp); err != nil {
+		web.Error(w, 500, fmt.Errorf("parse a11y tree: %w", err))
+		return
+	}
+
+	if selector != "" {
+		var scopeNodeID int64
+		if err := chromedp.Run(tCtx,
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				p := map[string]any{"nodeId": 0, "selector": selector}
+				var docResult json.RawMessage
+				if err := chromedp.FromContext(ctx).Target.Execute(ctx, "DOM.getDocument", map[string]any{"depth": 0}, &docResult); err != nil {
+					return fmt.Errorf("get document: %w", err)
+				}
+				var doc struct {
+					Root struct {
+						NodeID int64 `json:"nodeId"`
+					} `json:"root"`
+				}
+				if err := json.Unmarshal(docResult, &doc); err != nil {
+					return err
+				}
+				p["nodeId"] = doc.Root.NodeID
+				var qResult json.RawMessage
+				if err := chromedp.FromContext(ctx).Target.Execute(ctx, "DOM.querySelector", p, &qResult); err != nil {
+					return fmt.Errorf("querySelector: %w", err)
+				}
+				var qr struct {
+					NodeID int64 `json:"nodeId"`
+				}
+				if err := json.Unmarshal(qResult, &qr); err != nil {
+					return err
+				}
+				if qr.NodeID == 0 {
+					return fmt.Errorf("selector %q not found", selector)
+				}
+				var descResult json.RawMessage
+				if err := chromedp.FromContext(ctx).Target.Execute(ctx, "DOM.describeNode", map[string]any{"nodeId": qr.NodeID}, &descResult); err != nil {
+					return fmt.Errorf("describe node: %w", err)
+				}
+				var desc struct {
+					Node struct {
+						BackendNodeID int64 `json:"backendNodeId"`
+					} `json:"node"`
+				}
+				if err := json.Unmarshal(descResult, &desc); err != nil {
+					return err
+				}
+				scopeNodeID = desc.Node.BackendNodeID
+				return nil
+			}),
+		); err != nil {
+			web.Error(w, 400, fmt.Errorf("selector: %w", err))
+			return
+		}
+
+		treeResp.Nodes = bridge.FilterSubtree(treeResp.Nodes, scopeNodeID)
+	}
+
+	flat, refs := bridge.BuildSnapshot(treeResp.Nodes, filter, maxDepth)
+
+	truncated := false
+	if maxTokens > 0 {
+		flat, truncated = bridge.TruncateToTokens(flat, maxTokens, format)
+	}
+
+	var prevNodes []bridge.A11yNode
+	if doDiff {
+		if prev := h.Bridge.GetRefCache(resolvedTabID); prev != nil {
+			prevNodes = prev.Nodes
+		}
+	}
+
+	h.Bridge.SetRefCache(resolvedTabID, &bridge.RefCache{Refs: refs, Nodes: flat})
+
+	var url, title string
+	_ = chromedp.Run(tCtx,
+		chromedp.Location(&url),
+		chromedp.Title(&title),
+	)
+
+	if output == "file" {
+		snapshotDir := filepath.Join(h.Config.StateDir, "snapshots")
+		if err := os.MkdirAll(snapshotDir, 0750); err != nil {
+			web.Error(w, 500, fmt.Errorf("create snapshot dir: %w", err))
+			return
+		}
+
+		timestamp := time.Now().Format("20060102-150405")
+		var filename string
+		var content []byte
+
+		switch format {
+		case "text":
+			filename = fmt.Sprintf("snapshot-%s.txt", timestamp)
+			textContent := fmt.Sprintf("# %s\n# %s\n# %d nodes\n# %s\n\n%s",
+				title, url, len(flat), time.Now().Format(time.RFC3339),
+				bridge.FormatSnapshotText(flat))
+			content = []byte(textContent)
+		case "yaml":
+			filename = fmt.Sprintf("snapshot-%s.yaml", timestamp)
+			data := map[string]any{
+				"url":       url,
+				"title":     title,
+				"timestamp": time.Now().Format(time.RFC3339),
+				"nodes":     flat,
+				"count":     len(flat),
 			}
-			d++
-			cur = p
-		}
-		return d
-	}
-
-	flat := make([]A11yNode, 0)
-	refs := make(map[string]int64)
-	refID := 0
-
-	for _, n := range nodes {
-		if n.Ignored {
-			continue
-		}
-
-		role := n.Role.String()
-		name := n.Name.String()
-
-		if role == "none" || role == "generic" || role == "InlineTextBox" {
-			continue
-		}
-		if name == "" && role == "StaticText" {
-			continue
-		}
-
-		depth := depthOf(n.NodeID)
-		if maxDepth >= 0 && depth > maxDepth {
-			continue
-		}
-		if filter == FilterInteractive && !InteractiveRoles[role] {
-			continue
-		}
-
-		ref := fmt.Sprintf("e%d", refID)
-		entry := A11yNode{
-			Ref:   ref,
-			Role:  role,
-			Name:  name,
-			Depth: depth,
-		}
-
-		if v := n.Value.String(); v != "" {
-			entry.Value = v
-		}
-		if n.BackendDOMNodeID != 0 {
-			entry.NodeID = n.BackendDOMNodeID
-			refs[ref] = n.BackendDOMNodeID
-		}
-
-		for _, prop := range n.Properties {
-			if prop.Name == "disabled" && prop.Value.String() == "true" {
-				entry.Disabled = true
+			if doDiff && prevNodes != nil {
+				added, changed, removed := bridge.DiffSnapshot(prevNodes, flat)
+				data["diff"] = true
+				data["added"] = added
+				data["changed"] = changed
+				data["removed"] = removed
+				data["counts"] = map[string]int{
+					"added":   len(added),
+					"changed": len(changed),
+					"removed": len(removed),
+					"total":   len(flat),
+				}
 			}
-			if prop.Name == "focused" && prop.Value.String() == "true" {
-				entry.Focused = true
+			var err error
+			content, err = yaml.Marshal(data)
+			if err != nil {
+				web.Error(w, 500, fmt.Errorf("marshal yaml: %w", err))
+				return
+			}
+		default:
+			filename = fmt.Sprintf("snapshot-%s.json", timestamp)
+			data := map[string]any{
+				"url":       url,
+				"title":     title,
+				"timestamp": time.Now().Format(time.RFC3339),
+				"nodes":     flat,
+				"count":     len(flat),
+			}
+			if doDiff && prevNodes != nil {
+				added, changed, removed := bridge.DiffSnapshot(prevNodes, flat)
+				data["diff"] = true
+				data["added"] = added
+				data["changed"] = changed
+				data["removed"] = removed
+				data["counts"] = map[string]int{
+					"added":   len(added),
+					"changed": len(changed),
+					"removed": len(removed),
+					"total":   len(flat),
+				}
+			}
+			var err error
+			content, err = json.MarshalIndent(data, "", "  ")
+			if err != nil {
+				web.Error(w, 500, fmt.Errorf("marshal snapshot: %w", err))
+				return
 			}
 		}
 
-		flat = append(flat, entry)
-		refID++
+		filePath := filepath.Join(snapshotDir, filename)
+		if outputPath != "" {
+			safe, err := web.SafePath(h.Config.StateDir, outputPath)
+			if err != nil {
+				web.Error(w, 400, fmt.Errorf("invalid path: %w", err))
+				return
+			}
+			filePath = safe
+			if err := os.MkdirAll(filepath.Dir(filePath), 0750); err != nil {
+				web.Error(w, 500, fmt.Errorf("create output dir: %w", err))
+				return
+			}
+		}
+		if err := os.WriteFile(filePath, content, 0600); err != nil {
+			web.Error(w, 500, fmt.Errorf("write snapshot: %w", err))
+			return
+		}
+
+		web.JSON(w, 200, map[string]any{
+			"path":      filePath,
+			"size":      len(content),
+			"format":    format,
+			"timestamp": timestamp,
+		})
+		return
 	}
 
-	return flat, refs
+	if doDiff && prevNodes != nil {
+		added, changed, removed := bridge.DiffSnapshot(prevNodes, flat)
+		web.JSON(w, 200, map[string]any{
+			"url":     url,
+			"title":   title,
+			"diff":    true,
+			"added":   added,
+			"changed": changed,
+			"removed": removed,
+			"counts": map[string]int{
+				"added":   len(added),
+				"changed": len(changed),
+				"removed": len(removed),
+				"total":   len(flat),
+			},
+		})
+		return
+	}
+
+	switch format {
+	case "compact":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(200)
+		_, _ = fmt.Fprintf(w, "# %s | %s | %d nodes", title, url, len(flat))
+		if truncated {
+			_, _ = fmt.Fprintf(w, " (truncated to ~%d tokens)", maxTokens)
+		}
+		_, _ = w.Write([]byte("\n"))
+		_, _ = w.Write([]byte(bridge.FormatSnapshotCompact(flat)))
+	case "text":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(200)
+		_, _ = fmt.Fprintf(w, "# %s\n# %s\n# %d nodes\n\n", title, url, len(flat))
+		_, _ = w.Write([]byte(bridge.FormatSnapshotText(flat)))
+	case "yaml":
+		data := map[string]any{
+			"url":   url,
+			"title": title,
+			"nodes": flat,
+			"count": len(flat),
+		}
+		yamlContent, err := yaml.Marshal(data)
+		if err != nil {
+			web.Error(w, 500, fmt.Errorf("marshal yaml: %w", err))
+			return
+		}
+		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		w.WriteHeader(200)
+		_, _ = w.Write(yamlContent)
+	default:
+		resp := map[string]any{
+			"url":   url,
+			"title": title,
+			"nodes": flat,
+			"count": len(flat),
+		}
+		if truncated {
+			resp["truncated"] = true
+			resp["maxTokens"] = maxTokens
+		}
+		web.JSON(w, 200, resp)
+	}
 }
 
-func FilterSubtree(nodes []RawAXNode, scopeBackendID int64) []RawAXNode {
-	scopeAXID := ""
-	for _, n := range nodes {
-		if n.BackendDOMNodeID == scopeBackendID {
-			scopeAXID = n.NodeID
-			break
-		}
-	}
-	if scopeAXID == "" {
-		return nodes
+// HandleTabSnapshot returns snapshot for a tab identified by path ID.
+//
+// @Endpoint GET /tabs/{id}/snapshot
+func (h *Handlers) HandleTabSnapshot(w http.ResponseWriter, r *http.Request) {
+	tabID := r.PathValue("id")
+	if tabID == "" {
+		web.Error(w, 400, fmt.Errorf("tab id required"))
+		return
 	}
 
-	childMap := make(map[string][]string, len(nodes))
-	for _, n := range nodes {
-		childMap[n.NodeID] = append(childMap[n.NodeID], n.ChildIDs...)
-	}
+	q := r.URL.Query()
+	q.Set("tabId", tabID)
 
-	include := make(map[string]bool)
-	include[scopeAXID] = true
-	queue := []string{scopeAXID}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		for _, cid := range childMap[cur] {
-			if !include[cid] {
-				include[cid] = true
-				queue = append(queue, cid)
-			}
-		}
-	}
+	req := r.Clone(r.Context())
+	u := *r.URL
+	u.RawQuery = q.Encode()
+	req.URL = &u
 
-	result := make([]RawAXNode, 0, len(include))
-	for _, n := range nodes {
-		if include[n.NodeID] {
-			result = append(result, n)
-		}
-	}
-	return result
-}
-
-func DiffSnapshot(prev, curr []A11yNode) (added, changed, removed []A11yNode) {
-	prevMap := make(map[string]A11yNode, len(prev))
-	for _, n := range prev {
-		key := fmt.Sprintf("%s:%s:%d", n.Role, n.Name, n.NodeID)
-		prevMap[key] = n
-	}
-
-	currMap := make(map[string]bool, len(curr))
-	for _, n := range curr {
-		key := fmt.Sprintf("%s:%s:%d", n.Role, n.Name, n.NodeID)
-		currMap[key] = true
-		old, existed := prevMap[key]
-		if !existed {
-			added = append(added, n)
-		} else if old.Value != n.Value || old.Focused != n.Focused || old.Disabled != n.Disabled {
-			changed = append(changed, n)
-		}
-	}
-
-	for _, n := range prev {
-		key := fmt.Sprintf("%s:%s:%d", n.Role, n.Name, n.NodeID)
-		if !currMap[key] {
-			removed = append(removed, n)
-		}
-	}
-
-	return
+	h.HandleSnapshot(w, req)
 }
