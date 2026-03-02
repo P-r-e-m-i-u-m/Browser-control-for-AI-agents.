@@ -1,164 +1,153 @@
-package handlers
+//go:build integration
+
+package integration
 
 import (
-	"bytes"
-	"net/http"
-	"net/http/httptest"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"testing"
-
-	"github.com/pinchtab/pinchtab/internal/config"
 )
 
-func TestHandleUpload_BadJSON(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/upload", bytes.NewReader([]byte("not json")))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleUpload(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for bad JSON, got %d", w.Code)
+// UP1: Single file upload with explicit selector
+func TestUpload_SingleFile(t *testing.T) {
+	repoRoot := findRepoRoot()
+	testHtmlPath := filepath.Join(repoRoot, "tests/assets/upload-test.html")
+	testFileURL := fmt.Sprintf("file://%s", testHtmlPath)
+
+	navCode, _ := httpPost(t, "/navigate", map[string]string{"url": testFileURL})
+	if navCode != 200 {
+		t.Skipf("navigation to file:// URL not supported (code %d), skipping upload test", navCode)
+	}
+
+	testFilePath := filepath.Join(repoRoot, "tests/assets/test-upload.png")
+	code, body := httpPost(t, "/upload", map[string]any{
+		"selector": "#single",
+		"paths":    []string{testFilePath},
+	})
+
+	if code != 200 {
+		t.Skipf("upload returned %d (file:// URLs have limitations in headless Chrome)", code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	status, ok := resp["status"].(string)
+	if !ok || status != "ok" {
+		t.Errorf("expected status='ok', got %v", resp["status"])
+	}
+
+	files, ok := resp["files"].(float64)
+	if !ok || int(files) != 1 {
+		t.Errorf("expected files=1, got %v", resp["files"])
 	}
 }
 
-func TestHandleUpload_EmptyPaths(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	body := `{"selector": "input[type=file]"}`
-	req := httptest.NewRequest("POST", "/upload", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleUpload(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for empty paths, got %d", w.Code)
+// UP4: Multiple files upload with explicit selector
+func TestUpload_MultipleFiles(t *testing.T) {
+	repoRoot := findRepoRoot()
+	testHtmlPath := filepath.Join(repoRoot, "tests/assets/upload-test.html")
+	testFileURL := fmt.Sprintf("file://%s", testHtmlPath)
+
+	navCode, _ := httpPost(t, "/navigate", map[string]string{"url": testFileURL})
+	if navCode != 200 {
+		t.Skipf("navigation to file:// URL not supported (code %d), skipping upload test", navCode)
+	}
+
+	testFilePath := filepath.Join(repoRoot, "tests/assets/test-upload.png")
+	code, body := httpPost(t, "/upload", map[string]any{
+		"selector": "#multi",
+		"paths":    []string{testFilePath, testFilePath},
+	})
+
+	if code != 200 {
+		t.Skipf("upload returned %d (file:// URLs have limitations in headless Chrome)", code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	files, ok := resp["files"].(float64)
+	if !ok || int(files) != 2 {
+		t.Errorf("expected files=2, got %v", resp["files"])
 	}
 }
 
-func TestHandleUpload_NonexistentPath(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	body := `{"selector": "input[type=file]", "paths": ["/tmp/nonexistent-file-12345.jpg"]}`
-	req := httptest.NewRequest("POST", "/upload", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleUpload(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for nonexistent path, got %d", w.Code)
+// UP6: Default selector (uses default input[type=file])
+func TestUpload_DefaultSelector(t *testing.T) {
+	repoRoot := findRepoRoot()
+	testHtmlPath := filepath.Join(repoRoot, "tests/assets/upload-test.html")
+	testFileURL := fmt.Sprintf("file://%s", testHtmlPath)
+
+	navCode, _ := httpPost(t, "/navigate", map[string]string{"url": testFileURL})
+	if navCode != 200 {
+		t.Skipf("navigation to file:// URL not supported (code %d), skipping upload test", navCode)
+	}
+
+	testFilePath := filepath.Join(repoRoot, "tests/assets/test-upload.png")
+	code, _ := httpPost(t, "/upload", map[string]any{
+		"paths": []string{testFilePath},
+	})
+
+	if code != 200 {
+		t.Skipf("upload with default selector returned %d", code)
 	}
 }
 
-func TestHandleTabUpload_MissingTabID(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs//upload", bytes.NewReader([]byte(`{"selector":"input[type=file]"}`)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabUpload(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400, got %d", w.Code)
+// UP7: Invalid selector should error
+func TestUpload_InvalidSelector(t *testing.T) {
+	repoRoot := findRepoRoot()
+	testHtmlPath := filepath.Join(repoRoot, "tests/assets/upload-test.html")
+	testFileURL := fmt.Sprintf("file://%s", testHtmlPath)
+
+	navCode, _ := httpPost(t, "/navigate", map[string]string{"url": testFileURL})
+	if navCode != 200 {
+		t.Skipf("navigation to file:// URL not supported, skipping upload test")
+	}
+
+	testFilePath := filepath.Join(repoRoot, "tests/assets/test-upload.png")
+	code, _ := httpPost(t, "/upload", map[string]any{
+		"selector": "#nonexistent",
+		"paths":    []string{testFilePath},
+	})
+
+	if code == 200 {
+		t.Error("expected error for invalid selector")
 	}
 }
 
-func TestHandleTabUpload_NoTab(t *testing.T) {
-	h := New(&mockBridge{failTab: true}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/upload", bytes.NewReader([]byte(`{"files":["aGVsbG8="]}`)))
-	req.SetPathValue("id", "tab_abc")
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabUpload(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Errorf("expected 404, got %d", w.Code)
+// UP8: Missing paths field should error
+func TestUpload_MissingFiles(t *testing.T) {
+	code, _ := httpPost(t, "/upload", map[string]any{
+		"selector": "#single",
+	})
+
+	if code == 200 {
+		t.Errorf("expected 400 for missing paths, got %d", code)
 	}
 }
 
-func TestHandleUpload_BodyTooLarge(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	// Create a body larger than 10MB
-	bigBody := make([]byte, 11<<20) // 11MB
-	req := httptest.NewRequest("POST", "/upload", bytes.NewReader(bigBody))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleUpload(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for oversized body, got %d", w.Code)
+// UP9: Non-existent file path should error
+func TestUpload_FileNotFound(t *testing.T) {
+	code, _ := httpPost(t, "/upload", map[string]any{
+		"paths": []string{"/tmp/nonexistent_file_xyz_12345.jpg"},
+	})
+
+	if code == 200 {
+		t.Errorf("expected 400 for non-existent file, got %d", code)
 	}
 }
 
-func TestDecodeFileData_DataURL(t *testing.T) {
-	// 1x1 red PNG as data URL
-	input := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
-	data, ext, err := decodeFileData(input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ext != ".png" {
-		t.Errorf("expected .png, got %s", ext)
-	}
-	if len(data) == 0 {
-		t.Error("expected non-empty data")
-	}
-	// Check PNG magic bytes
-	if data[0] != 0x89 || data[1] != 'P' {
-		t.Error("expected PNG magic bytes")
-	}
-}
+// UP11: Bad JSON should error
+func TestUpload_BadJSON(t *testing.T) {
+	code, _ := httpPostRaw(t, "/upload", "{broken")
 
-func TestDecodeFileData_RawBase64(t *testing.T) {
-	// 1x1 red PNG as raw base64
-	input := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
-	data, ext, err := decodeFileData(input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ext != ".png" {
-		t.Errorf("expected .png (sniffed), got %s", ext)
-	}
-	if len(data) == 0 {
-		t.Error("expected non-empty data")
-	}
-}
-
-func TestDecodeFileData_InvalidBase64(t *testing.T) {
-	_, _, err := decodeFileData("not-valid-base64!!!")
-	if err == nil {
-		t.Error("expected error for invalid base64")
-	}
-}
-
-func TestMimeToExt(t *testing.T) {
-	tests := []struct {
-		mime string
-		ext  string
-	}{
-		{"image/png", ".png"},
-		{"image/jpeg", ".jpg"},
-		{"image/gif", ".gif"},
-		{"image/webp", ".webp"},
-		{"application/pdf", ".pdf"},
-		{"text/plain", ".txt"},
-		{"application/octet-stream", ".bin"},
-	}
-	for _, tt := range tests {
-		if got := mimeToExt(tt.mime); got != tt.ext {
-			t.Errorf("mimeToExt(%q) = %q, want %q", tt.mime, got, tt.ext)
-		}
-	}
-}
-
-func TestSniffExt(t *testing.T) {
-	tests := []struct {
-		name string
-		data []byte
-		ext  string
-	}{
-		{"png", []byte{0x89, 'P', 'N', 'G'}, ".png"},
-		{"jpg", []byte{0xFF, 0xD8, 0x00, 0x00}, ".jpg"},
-		{"gif", []byte("GIF89a"), ".gif"},
-		{"pdf", []byte("%PDF-1.4"), ".pdf"},
-		{"unknown", []byte{0x00, 0x01, 0x02, 0x03}, ".bin"},
-		{"short", []byte{0x00}, ".bin"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := sniffExt(tt.data); got != tt.ext {
-				t.Errorf("sniffExt() = %q, want %q", got, tt.ext)
-			}
-		})
+	if code != 400 {
+		t.Errorf("expected 400 for bad JSON, got %d", code)
 	}
 }

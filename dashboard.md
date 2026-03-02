@@ -1,258 +1,268 @@
-# Dashboard
+# Pinchtab Dashboard Test Plan
 
-PinchTab includes a built-in web dashboard for monitoring and managing instances, profiles, and agent activity.
+**Goal:** Validate the dashboard mode — profile management, orchestrator (instance lifecycle), proxy routing, SSE events, and UI serving.
 
-Access the dashboard at **`http://localhost:9867`** (adjust port if needed).
-
-Alternatively, use **`http://localhost:9867/dashboard`** (also works for backward compatibility).
+**Constraint:** Tests MUST NOT delete or modify existing profiles. Use a dedicated test profile (`__test_profile__`) for all mutations.
 
 ---
 
-## Dashboard Overview
+## 1. Health & Mode
 
-The dashboard provides four main screens:
-
-1. **Instances** — View and manage running Chrome instances
-2. **Profiles** — Browse and launch saved browser profiles
-3. **Profile Details** — Configure and launch a specific profile
-4. **Agents Feed** — Monitor agent activity and automation workflows
-
----
-
-## Instances Screen
-
-> **Screenshot placeholder:** Instances view
-
-### What It Shows
-
-- List of all running PinchTab instances
-- Port number for each instance
-- Instance status (running, stopped, idle)
-- Number of tabs in each instance
-- Profile name (if any) for each instance
-
-### What You Can Do
-
-- **View details** — Click an instance to see full information
-- **Create new instance** — Start a new Chrome process
-- **Stop instance** — Shut down a running instance
-- **View tabs** — See all tabs open in the instance
-
-### Use Cases
-
-- Monitor multiple instances running in parallel
-- Check resource usage per instance
-- Stop instances when no longer needed
-- Debug instance configuration
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DH1 | Dashboard health | `GET /health` | 200, `{"status":"ok","mode":"dashboard"}` | ✅ |
+| DH2 | Dashboard UI serves | `GET /dashboard` | 200, HTML with `<html` | ✅ |
+| DH3 | Static assets serve | `GET /dashboard/app.js` | 200, JavaScript content | ✅ |
+| DH4 | Static CSS serves | `GET /dashboard/base.css` | 200, CSS content | ✅ |
 
 ---
 
-## Profiles Screen
+## 2. Profile Management (CRUD)
 
-> **Screenshot placeholder:** Profiles view
+All tests use `__test_profile__` — cleaned up at end.
 
-### What It Shows
-
-- Grid of all available browser profiles
-- Each profile card displays:
-  - Profile name
-  - Associated email/account (if available)
-  - Last used timestamp
-  - Current status (running, stopped)
-  - Quick info (cookies count, stored data size)
-
-### What You Can Do
-
-- **Launch profile** — Start a new instance with this profile
-- **View details** — Click profile card to see configuration details
-- **Edit profile** — Modify profile settings (name, metadata)
-- **Delete profile** — Remove a profile (with confirmation)
-- **Search/filter** — Find profiles by name or account
-
-### Use Cases
-
-- Quickly launch a profile for a specific user account
-- Switch between different login contexts
-- See which profiles are currently active
-- Manage multiple user sessions
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DP1 | List profiles | `GET /profiles` | 200, array of profiles (existing ones present) | ✅ |
+| DP2 | Create profile | `POST /profiles/create {"name":"__test_profile__"}` | 201, created | ✅ |
+| DP3 | Create duplicate | `POST /profiles/create {"name":"__test_profile__"}` | 409, conflict | ✅ |
+| DP4 | Create missing name | `POST /profiles/create {}` | 400, name required | ✅ |
+| DP5 | Create bad JSON | `POST /profiles/create {broken` | 400, invalid JSON | ✅ |
+| DP6 | Create with metadata | `POST /profiles/create {"name":"__test_profile_meta__","useWhen":"testing","description":"test profile"}` | 201, created with meta | ✅ |
+| DP7 | Update metadata | `PATCH /profiles/__test_profile__ {"useWhen":"updated","description":"updated desc"}` | 200, updated info | ✅ |
+| DP8 | Rename profile | `PATCH /profiles/__test_profile__ {"name":"__test_profile_renamed__"}` | 200, renamed | ✅ |
+| DP9 | Reset profile | `POST /profiles/__test_profile_renamed__/reset` | 200, reset | ✅ |
+| DP10 | Delete profile | `DELETE /profiles/__test_profile_renamed__` | 200, deleted | ✅ |
+| DP11 | Delete nonexistent | `DELETE /profiles/__nonexistent__` | 404 | ✅ |
+| DP12 | Reset nonexistent | `POST /profiles/__nonexistent__/reset` | 404 | ✅ |
+| DP13 | Profile logs (empty) | `GET /profiles/__test_profile_meta__/logs` | 200, empty array | ✅ |
+| DP14 | Profile analytics | `GET /profiles/__test_profile_meta__/analytics` | 200, analytics object | ✅ |
+| DP15 | Cleanup meta profile | `DELETE /profiles/__test_profile_meta__` | 200, deleted | ✅ |
 
 ---
 
-## Profile Details Screen
+## 3. Orchestrator — Instance Lifecycle
 
-> **Screenshot placeholder:** Profile details view
-
-### What It Shows
-
-- **Profile name** — Editable identifier
-- **Account info** — Associated email, username, or account ID
-- **Launch settings**:
-  - Headless or headed mode
-  - Port assignment
-  - Stealth level (light, medium, full)
-  - Environment variables
-- **State info**:
-  - Created date
-  - Last modified
-  - Data size (cookies, storage, cache)
-  - Number of saved tabs
-- **Instances using this profile** — Currently running instances
-
-### What You Can Do
-
-- **Launch** — Start a new instance with this profile
-- **Edit** — Modify profile configuration
-- **View data** — See stored cookies, local storage, browsing history
-- **Clear data** — Reset cookies/cache while keeping profile
-- **Export** — Backup profile configuration
-- **Delete** — Remove profile entirely
-
-### Use Cases
-
-- Configure launch options before starting an instance
-- Check what data is stored in a profile
-- Clone a profile for a similar use case
-- Debug profile-related issues
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DO1 | List instances (initial) | `GET /instances` | 200, array (may be empty or have running instances) | ✅ |
+| DO2 | Launch instance | `POST /instances/launch {"name":"__test_profile__","port":"<free>"}` | 201, instance with id/status | ✅ |
+| DO3 | Launch missing fields | `POST /instances/launch {"name":""}` | 400, name and port required | ✅ |
+| DO4 | Launch bad JSON | `POST /instances/launch {broken` | 400 | ✅ |
+| DO5 | Instance appears in list | `GET /instances` | Array includes __test_profile__ instance | ✅ |
+| DO6 | Profile instance status | `GET /profiles/__test_profile__/instance` | 200, running=true, port matches | ✅ |
+| DO7 | Instance logs | `GET /instances/{id}/logs` | 200, text content | ✅ |
+| DO8 | All tabs across instances | `GET /instances/tabs` | 200, array | ✅ |
+| DO9 | Stop instance | `POST /instances/{id}/stop` | 200, stopped | ✅ |
+| DO10 | Stop nonexistent | `POST /instances/nonexistent/stop` | 404 | ✅ |
+| DO11 | Profile instance after stop | `GET /profiles/__test_profile__/instance` | 200, running=false | ✅ |
+| DO12 | Launch duplicate port | Launch two profiles on same port | 409, conflict | ✅ |
+| DO13 | Stop by profile name | `POST /profiles/__test_profile__/stop` (when running) | 200, stopped | ✅ |
+| DO14 | Start by profile ID | `POST /profiles/{profileId}/start` | 201, auto-allocated port | ✅ |
+| DO15 | Stop by profile ID | `POST /profiles/{profileId}/stop` | 200, stopped | ✅ |
 
 ---
 
-## Agents Feed Screen
+## 4. Proxy Routing (requires running instance)
 
-> **Screenshot placeholder:** Agents feed view
-
-### What It Shows
-
-- Real-time activity log from all connected agents
-- Each entry displays:
-  - Timestamp
-  - Agent name/ID
-  - Action performed (navigated, clicked, extracted text, etc.)
-  - Associated instance/profile
-  - Result (success, error, pending)
-
-### What You Can Do
-
-- **Monitor agents** — Watch what automation is happening in real-time
-- **Filter by agent** — Show only activity from a specific agent
-- **Filter by instance** — Show only activity in a specific instance
-- **Search** — Find activities by action, URL, or data
-- **View details** — Click an entry to see full request/response
-- **Pause/resume** — Control logging verbosity
-
-### Use Cases
-
-- Debug agent automation workflows
-- Audit what agents have done
-- Monitor for errors or unexpected behavior
-- Understand which agents are most active
-- Troubleshoot automation issues
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DX1 | Proxy with no instances | Stop all test instances, `GET /snapshot` | 503, "no running instances" | ✅ |
+| DX2 | Proxy navigate | Launch instance, `POST /navigate {"url":"https://example.com"}` via dashboard port | 200, proxied to instance | ✅ |
+| DX3 | Proxy snapshot | `GET /snapshot` via dashboard port | 200, valid JSON with nodes | ✅ |
+| DX4 | Proxy tabs | `GET /tabs` via dashboard port | 200, array | ✅ |
+| DX5 | Proxy screenshot | `GET /screenshot` via dashboard port | 200, image data | ✅ |
+| DX6 | Proxy evaluate | `POST /evaluate {"expression":"1+1"}` via dashboard | 200, result | ✅ |
+| DX7 | Proxy cookies | `GET /cookies` via dashboard | 200, array | ✅ |
+| DX8 | Proxy stealth | `GET /stealth/status` via dashboard | 200, stealth info | ✅ |
 
 ---
 
-## Navigation
+## 5. SSE Events
 
-The dashboard header provides tabs to switch between screens:
-
-```text
-[Instances] | [Profiles] | [Profile Details] | [Agents]
-```
-
-You can also navigate by clicking:
-- An instance → shows its details
-- A profile → shows its profile details screen
-- An agent event → shows relevant instance/profile
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DS1 | SSE connect | `GET /dashboard/events` with Accept: text/event-stream | 200, receives `event: init` with agent data | ⚠️ |
+| DS2 | SSE keepalive | Hold connection 35s | Receives `: keepalive` comment | 🔧 Manual |
 
 ---
 
-## Status Indicators
+## 6. Dashboard Agents API
 
-### Instance Status
-- **Running** (green) — Active Chrome process
-- **Idle** (yellow) — Running but no tabs
-- **Stopped** (red) — Process not running
-
-### Profile Status
-- **Active** (green) — At least one instance using it
-- **Dormant** (gray) — No active instances
-- **Launching** (blue) — Instance starting
-
-### Agent Status
-- **Success** (green) — Action completed
-- **Error** (red) — Action failed
-- **Pending** (yellow) — In progress
-- **Cancelled** (gray) — Aborted
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DA1 | List agents | `GET /dashboard/agents` | 200, array of agent objects | ✅ |
 
 ---
 
-## Keyboard Shortcuts
+## 7. Edge Cases
 
-| Shortcut | Action |
-|---|---|
-| `R` | Refresh current screen |
-| `Esc` | Go back / Close modal |
-| `Ctrl+K` | Search |
-| `Ctrl+1` | Instances tab |
-| `Ctrl+2` | Profiles tab |
-| `Ctrl+3` | Profile Details tab |
-| `Ctrl+4` | Agents Feed tab |
+| # | Scenario | Steps | Expected | Auto |
+|---|----------|-------|----------|------|
+| DE1 | Shutdown endpoint | `POST /shutdown` | 200, dashboard shuts down | 🔧 Manual |
+| DE2 | CORS headers | `OPTIONS /health` | CORS headers present | ✅ |
+| DE3 | Port already in use | Launch on occupied port | 409 or error | ✅ |
+| DE4 | Rapid launch/stop | Launch → stop → launch same profile | Both succeed, no crash | ✅ |
+| DE5 | Screencast proxy info | `GET /instances/{id}/proxy/screencast?tabId=test` | 200, wsUrl | ✅ |
 
 ---
 
-## Dark Mode
+## 8. UI Functional Tests (Manual / Browser)
 
-The dashboard automatically uses your system's dark/light preference.
-
-Toggle manually:
-- Click the theme toggle in the top-right corner (sun/moon icon)
-- Preference is saved in browser local storage
-
----
-
-## Performance & Limits
-
-- **Refresh rate**: Real-time updates (WebSocket-based)
-- **History retention**: Last 1000 agent events (older events archived)
-- **Scalability**: Optimized for 10+ instances, 100+ profiles
-
-For high-throughput monitoring, consider using the REST API directly:
-
-```bash
-# Get all instances
-curl http://localhost:9867/instances
-
-# Get all profiles
-curl http://localhost:9867/profiles
-
-# Stream agent events
-curl http://localhost:9867/events/stream
-```
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| DU1 | Dashboard loads | Open `http://localhost:9867/dashboard` in browser | Page renders, profiles visible |
+| DU2 | Profile list shows | View Profiles tab | Existing profiles listed with status |
+| DU3 | Create profile via UI | Click create, enter name | Profile appears in list |
+| DU4 | Launch profile via UI | Click launch/start on a profile | Instance starts, status updates to running |
+| DU5 | Stop profile via UI | Click stop on running profile | Instance stops, status updates |
+| DU6 | Screencast tab | Switch to screencast tab while instance running | Live view of browser |
+| DU7 | Agents tab | Switch to agents tab | Shows connected agents / activity |
+| DU8 | Settings tab | Switch to settings tab | Displays configuration |
+| DU9 | Profile analytics via UI | Click analytics on a profile with history | Shows charts/stats |
 
 ---
 
-## Troubleshooting
+## 9. Endpoint Existence Checks
 
-### Dashboard Not Loading
+Verify every registered route returns a non-404 status (may return 400/503 for missing params, but not 404 routing failures).
 
-- Check if PinchTab is running: `curl http://localhost:9867/health`
-- Check the port: Default is `9867`, adjust if you started with `--port`
-- Clear browser cache: `Ctrl+Shift+Delete` (most browsers)
+### Dashboard / Health
 
-### No Instances Showing
+| # | Route | Method | Expected | Auto |
+|---|-------|--------|----------|------|
+| RE1 | `/health` | GET | 200 | ✅ |
+| RE2 | `/dashboard` | GET | 200 (HTML) | ✅ |
+| RE3 | `/dashboard/agents` | GET | 200 | ✅ |
+| RE4 | `/dashboard/events` | GET | 200 (SSE stream) | ✅ |
+| RE5 | `/shutdown` | POST | 200 (⚠️ kills dashboard) | 🔧 Manual |
 
-- Make sure at least one instance is running: `pinchtab --port 9867`
-- Refresh the page (`R` key)
-- Check browser console for errors (`F12`)
+### Profiles
 
-### Agent Events Not Updating
+| # | Route | Method | Expected | Auto |
+|---|-------|--------|----------|------|
+| RE6 | `/profiles` | GET | 200 | ✅ |
+| RE7 | `/profiles/create` | POST | 400 (no body) | ✅ |
+| RE8 | `/profiles/import` | POST | 400 (no body) | ✅ |
+| RE9 | `/profiles/meta` | PATCH | 400 (no body) | ✅ |
+| RE10 | `/profiles/__nonexistent__` | DELETE | 404 | ✅ |
+| RE11 | `/profiles/__nonexistent__` | PATCH | 400 (no body) | ✅ |
+| RE12 | `/profiles/__nonexistent__/reset` | POST | 404 | ✅ |
+| RE13 | `/profiles/__nonexistent__/logs` | GET | 200 (empty) | ✅ |
+| RE14 | `/profiles/__nonexistent__/analytics` | GET | 200 | ✅ |
+| RE15 | `/profiles/__nonexistent__/instance` | GET | 200 (running=false) | ✅ |
+| RE16 | `/profiles/__nonexistent__/stop` | POST | 404 | ✅ |
 
-- Confirm agents are actually running tasks
-- Check WebSocket connection: Open DevTools → Network → WS tab
-- Try refreshing the page
+### Orchestrator
+
+| # | Route | Method | Expected | Auto |
+|---|-------|--------|----------|------|
+| RE17 | `/instances` | GET | 200 | ✅ |
+| RE18 | `/instances/tabs` | GET | 200 | ✅ |
+| RE19 | `/instances/launch` | POST | 400 (no body) | ✅ |
+| RE20 | `/instances/nonexistent/stop` | POST | 404 | ✅ |
+| RE21 | `/instances/nonexistent/logs` | GET | 404 | ✅ |
+| RE22 | `/instances/nonexistent/proxy/screencast?tabId=x` | GET | 404 | ✅ |
+
+### Profile lifecycle (by ID — canonical for agents)
+
+| # | Route | Method | Expected | Auto |
+|---|-------|--------|----------|------|
+| RE23 | `/profiles/{id}/start` | POST | 201 (launches instance) | ✅ |
+| RE24 | `/profiles/{id}/stop` | POST | 200 (stops instance) | ✅ |
+| RE25a | `/profiles/{id}/instance` | GET | 200 (instance status) | ✅ |
+| RE25b | `/profiles/{unknownId}/start` | POST | 404 | ✅ |
+
+### Proxy endpoints (503 when no instance running)
+
+| # | Route | Method | Expected (no instance) | Auto |
+|---|-------|--------|------------------------|------|
+| RE25 | `/tabs` | GET | 503 | ✅ |
+| RE26 | `/snapshot` | GET | 503 | ✅ |
+| RE27 | `/screenshot` | GET | 503 | ✅ |
+| RE28 | `/text` | GET | 503 | ✅ |
+| RE29 | `/navigate` | POST | 503 | ✅ |
+| RE30 | `/action` | POST | 503 | ✅ |
+| RE31 | `/actions` | POST | 503 | ✅ |
+| RE32 | `/evaluate` | POST | 503 | ✅ |
+| RE33 | `/tab` | POST | 503 | ✅ |
+| RE34 | `/tab/lock` | POST | 503 | ✅ |
+| RE35 | `/tab/unlock` | POST | 503 | ✅ |
+| RE36 | `/cookies` | GET | 503 | ✅ |
+| RE37 | `/cookies` | POST | 503 | ✅ |
+| RE38 | `/stealth/status` | GET | 503 | ✅ |
+| RE39 | `/fingerprint/rotate` | POST | 503 | ✅ |
+| RE40 | `/screencast` | GET | 503 | ✅ |
+| RE41 | `/screencast/tabs` | GET | 503 | ✅ |
 
 ---
 
-## Next Steps
+## 10. Security: Validation Tests
 
-- [Core Concepts](core-concepts.md) — Understand instances, profiles, tabs
-- [Get Started](get-started.md) — Set up your first profile
-- [Headless vs Headed](headless-vs-headed.md) — Choose the right mode
+### DSE1: Profile Name Validation
+
+**Goal:** Verify invalid profile names are rejected by the API.
+
+**Steps:**
+1. Start dashboard
+2. Try to create profile with ".." in name:
+   ```bash
+   curl -X POST http://localhost:9867/profiles \
+     -H "Content-Type: application/json" \
+     -d '{"name":"../test"}'
+   ```
+   Should get **400 Bad Request** (invalid profile name)
+
+3. Try with "/" separator:
+   ```bash
+   curl -X POST http://localhost:9867/profiles \
+     -H "Content-Type: application/json" \
+     -d '{"name":"test/profile"}'
+   ```
+   Should get **400 Bad Request**
+
+4. Try with empty name:
+   ```bash
+   curl -X POST http://localhost:9867/profiles \
+     -H "Content-Type: application/json" \
+     -d '{"name":""}'
+   ```
+   Should get **400 Bad Request**
+
+5. Create valid profile (control):
+   ```bash
+   curl -X POST http://localhost:9867/profiles \
+     -H "Content-Type: application/json" \
+     -d '{"name":"__test_security__"}'
+   ```
+   Should get **201 Created**
+
+6. Clean up:
+   ```bash
+   curl -X DELETE http://localhost:9867/profiles/__test_security__
+   ```
+
+**Expected:** Invalid names rejected with 400, valid names accepted with 201.
+
+**Criteria:** ✓ ".." rejected | ✓ "/" rejected | ✓ "" rejected | ✓ Valid names work
+
+---
+
+## Release Criteria
+
+### Must Pass
+- All Section 1 (health/UI serving)
+- All Section 2 (profile CRUD) — no side effects on existing profiles
+- Section 3 DO1-DO11 (basic instance lifecycle)
+- Section 4 DX1-DX4 (proxy basics)
+- Section 9 RE1-RE41 (all endpoints reachable)
+
+### Should Pass
+- Section 3 DO12-DO15 (advanced orchestration)
+- Section 4 DX5-DX8 (all proxy endpoints)
+- Section 6 (agents API)
+
+### Nice to Have
+- Section 5 (SSE)
+- Section 7 (edge cases)
+- Section 8 (UI manual)

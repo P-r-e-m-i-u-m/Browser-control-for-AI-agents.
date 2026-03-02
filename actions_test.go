@@ -1,284 +1,359 @@
-package handlers
+//go:build integration
+
+package integration
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
-	"fmt"
-	"net/http/httptest"
+	"strings"
 	"testing"
-
-	"github.com/chromedp/cdproto/target"
-	"github.com/pinchtab/pinchtab/internal/bridge"
-	"github.com/pinchtab/pinchtab/internal/config"
 )
 
-type failMockBridge struct {
-	bridge.BridgeAPI
-}
+// A1: Click by ref — navigate to example.com, find the "More information..." link, click it
+func TestAction_Click(t *testing.T) {
+	navigate(t, "https://example.com")
+	defer closeCurrentTab(t)
 
-func (m *failMockBridge) TabContext(tabID string) (context.Context, string, error) {
-	return nil, "", fmt.Errorf("tab not found")
-}
+	// Get snapshot to find a clickable ref
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&format=text&tabId="+currentTabID)
+	s := string(snapBody)
 
-func (m *failMockBridge) ListTargets() ([]*target.Info, error) {
-	return nil, fmt.Errorf("list targets failed")
-}
-
-func (m *failMockBridge) EnsureChrome(cfg *config.RuntimeConfig) error {
-	return nil
-}
-
-func (m *failMockBridge) AvailableActions() []string {
-	return []string{bridge.ActionClick, bridge.ActionType}
-}
-
-func TestHandleActions_EmptyArray(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/actions", bytes.NewReader([]byte(`{"actions": []}`)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-
-	h.HandleActions(w, req)
-
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+	// Find a ref like [e0] or [e1] for the link
+	ref := findRef(s, "link")
+	if ref == "" {
+		t.Skip("no clickable link ref found in snapshot")
 	}
 
-	var resp map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-	if resp["error"] != "actions array is empty" {
-		t.Errorf("expected empty array error, got %v", resp["error"])
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "click",
+		"ref":   ref,
+	})
+	if code != 200 {
+		t.Errorf("click failed with %d", code)
 	}
 }
 
-func TestHandleTabAction_MissingTabID(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs//action", bytes.NewReader([]byte(`{"kind":"click"}`)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabAction(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// A1b: Click actually triggers navigation (verifies fix for issue #80)
+// This test ensures clicks dispatch at the correct element position, not (0,0)
+func TestAction_Click_TriggersNavigation(t *testing.T) {
+	navigate(t, "https://example.com")
+	defer closeCurrentTab(t)
+	t.Logf("current tab: %s", currentTabID)
+
+	// Get snapshot to find the "More information..." link
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&tabId="+currentTabID)
+
+	var snapResp struct {
+		Nodes []struct {
+			Ref  string `json:"ref"`
+			Role string `json:"role"`
+			Name string `json:"name"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(snapBody, &snapResp); err != nil {
+		t.Fatalf("failed to parse snapshot: %v", err)
+	}
+
+	// Find any link (example.com has "More information..." link)
+	var linkRef string
+	for _, n := range snapResp.Nodes {
+		if n.Role == "link" {
+			linkRef = n.Ref
+			t.Logf("found link: ref=%s name=%q", n.Ref, n.Name)
+			break
+		}
+	}
+	if linkRef == "" {
+		t.Skip("no link found in snapshot")
+	}
+
+	// Click the link with waitNav to wait for navigation
+	code, body := httpPost(t, "/action", map[string]any{
+		"tabId":   currentTabID,
+		"kind":    "click",
+		"ref":     linkRef,
+		"waitNav": true,
+	})
+	if code != 200 {
+		t.Fatalf("click failed with %d: %s", code, string(body))
+	}
+
+	// Verify navigation happened by checking the page content changed
+	// The "More information" link on example.com goes to iana.org
+	_, textBody := httpGet(t, "/text?tabId="+currentTabID)
+	text := string(textBody)
+
+	// After clicking, we should NOT be on example.com anymore
+	if strings.Contains(text, "Example Domain") && !strings.Contains(text, "IANA") {
+		t.Errorf("click did not trigger navigation - still on example.com (bug #80: click at wrong position)")
+	}
+	t.Logf("navigation verified: page content changed after click")
+}
+
+// A4: Press key
+func TestAction_Press(t *testing.T) {
+	navigate(t, "https://example.com")
+	defer closeCurrentTab(t)
+
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "press",
+		"key":   "Escape",
+	})
+	if code != 200 {
+		t.Errorf("press failed with %d", code)
 	}
 }
 
-func TestHandleTabAction_TabIDMismatch(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/action", bytes.NewReader([]byte(`{"tabId":"tab_other","kind":"click"}`)))
-	req.SetPathValue("id", "tab_abc")
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabAction(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// A9: Unknown kind
+func TestAction_UnknownKind(t *testing.T) {
+	code, _ := httpPost(t, "/action", map[string]string{"kind": "dance"})
+	if code != 400 {
+		t.Errorf("expected 400 for unknown kind, got %d", code)
 	}
 }
 
-func TestHandleTabAction_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/action", bytes.NewReader([]byte(`{"kind":"click"}`)))
-	req.SetPathValue("id", "tab_abc")
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabAction(w, req)
-	if w.Code != 404 {
-		t.Errorf("expected 404, got %d", w.Code)
+// A10: Missing kind
+func TestAction_MissingKind(t *testing.T) {
+	code, _ := httpPost(t, "/action", map[string]string{"ref": "e0"})
+	if code != 400 {
+		t.Errorf("expected 400 for missing kind, got %d", code)
 	}
 }
 
-func TestHandleActions_NoTabError(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
+// A11: Ref not found
+func TestAction_RefNotFound(t *testing.T) {
+	navigate(t, "https://example.com")
+	defer closeCurrentTab(t)
 
-	body := `{
-		"actions": [
-			{"kind": "click", "selector": "button"}
-		]
-	}`
-
-	req := httptest.NewRequest("POST", "/actions", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-
-	h.HandleActions(w, req)
-
-	if w.Code != 404 {
-		t.Errorf("expected 404 for no tab, got %d", w.Code)
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "click",
+		"ref":   "e9999",
+	})
+	// Should be an error (400 or 500)
+	if code == 200 {
+		t.Error("expected error for non-existent ref")
 	}
 }
 
-func TestHandleTabActions_MissingTabID(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs//actions", bytes.NewReader([]byte(`{"actions":[{"kind":"click"}]}`)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabActions(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// A12: CSS selector click
+func TestAction_CSSSelector(t *testing.T) {
+	navigate(t, "https://example.com")
+	defer closeCurrentTab(t)
+
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId":    currentTabID,
+		"kind":     "click",
+		"selector": "a",
+	})
+	if code != 200 {
+		t.Errorf("CSS selector click failed with %d", code)
 	}
 }
 
-func TestHandleTabActions_TabIDMismatch(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/actions", bytes.NewReader([]byte(`{"tabId":"tab_other","actions":[{"kind":"click"}]}`)))
-	req.SetPathValue("id", "tab_abc")
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabActions(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// Helper: find a ref for a given role in text snapshot
+func findRef(snapshot string, role string) string {
+	lines := strings.Split(snapshot, "\n")
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), role) {
+			// Look for [eN] pattern
+			idx := strings.Index(line, "[e")
+			if idx >= 0 {
+				end := strings.Index(line[idx:], "]")
+				if end > 0 {
+					return line[idx+1 : idx+end]
+				}
+			}
+			// Also try eN at start of line
+			trimmed := strings.TrimSpace(line)
+			if len(trimmed) > 1 && trimmed[0] == 'e' {
+				parts := strings.Fields(trimmed)
+				if len(parts) > 0 && len(parts[0]) <= 5 {
+					return parts[0]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// A2: Type by ref — need an input element
+func TestAction_Type(t *testing.T) {
+	// Navigate to httpbin form
+	navigate(t, "https://httpbin.org/forms/post")
+	defer closeCurrentTab(t)
+
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&format=text&tabId="+currentTabID)
+	ref := findRef(string(snapBody), "textbox")
+	if ref == "" {
+		ref = findRef(string(snapBody), "input")
+	}
+	if ref == "" {
+		t.Skip("no input ref found")
+	}
+
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "type",
+		"ref":   ref,
+		"text":  "test input",
+	})
+	if code != 200 {
+		t.Errorf("type failed with %d", code)
 	}
 }
 
-func TestHandleTabActions_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/actions", bytes.NewReader([]byte(`{"actions":[{"kind":"click"}]}`)))
-	req.SetPathValue("id", "tab_abc")
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.HandleTabActions(w, req)
-	if w.Code != 404 {
-		t.Errorf("expected 404, got %d", w.Code)
+// A3: Fill by ref
+func TestAction_Fill(t *testing.T) {
+	navigate(t, "https://httpbin.org/forms/post")
+	defer closeCurrentTab(t)
+
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&format=text&tabId="+currentTabID)
+	ref := findRef(string(snapBody), "textbox")
+	if ref == "" {
+		ref = findRef(string(snapBody), "input")
+	}
+	if ref == "" {
+		t.Skip("no input ref found")
+	}
+
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "fill",
+		"ref":   ref,
+		"text":  "filled value",
+	})
+	if code != 200 {
+		t.Errorf("fill failed with %d", code)
 	}
 }
 
-func TestHandleGetCookies_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
+// A5: Focus
+func TestAction_Focus(t *testing.T) {
+	navigate(t, "https://httpbin.org/forms/post")
+	defer closeCurrentTab(t)
 
-	req := httptest.NewRequest("GET", "/cookies", nil)
-	w := httptest.NewRecorder()
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&format=text&tabId="+currentTabID)
+	ref := findRef(string(snapBody), "textbox")
+	if ref == "" {
+		t.Skip("no focusable ref found")
+	}
 
-	h.HandleGetCookies(w, req)
-
-	if w.Code != 404 {
-		t.Errorf("expected 404 for no tab, got %d", w.Code)
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "focus",
+		"ref":   ref,
+	})
+	if code != 200 {
+		t.Errorf("focus failed with %d", code)
 	}
 }
 
-func TestHandleSetCookies_EmptyURL(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
+// A8: Scroll
+func TestAction_Scroll(t *testing.T) {
+	navigate(t, "https://example.com")
+	defer closeCurrentTab(t)
 
-	body := `{"cookies": [{"name": "test", "value": "123"}]}`
-	req := httptest.NewRequest("POST", "/cookies", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-
-	h.HandleSetCookies(w, req)
-
-	if w.Code != 400 {
-		t.Errorf("expected 400 for missing url, got %d", w.Code)
-	}
-
-	var resp map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-	if resp["error"] != "url is required" {
-		t.Errorf("expected url required error, got %v", resp["error"])
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId":     currentTabID,
+		"kind":      "scroll",
+		"direction": "down",
+	})
+	if code != 200 {
+		t.Errorf("scroll failed with %d", code)
 	}
 }
 
-func TestHandleSetCookies_EmptyCookies(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-
-	body := `{"url": "https://example.com", "cookies": []}`
-	req := httptest.NewRequest("POST", "/cookies", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-
-	h.HandleSetCookies(w, req)
-
-	if w.Code != 400 {
-		t.Errorf("expected 400 for empty cookies, got %d", w.Code)
+// Batch actions (A14)
+func TestAction_Batch(t *testing.T) {
+	navigate(t, "https://example.com")
+	payload := map[string]any{
+		"tabId": currentTabID,
+		"actions": []map[string]any{
+			{"kind": "press", "key": "Escape"},
+			{"kind": "scroll", "direction": "down"},
+		},
+	}
+	data, _ := json.Marshal(payload)
+	code, body := httpPostRaw(t, "/actions", string(data))
+	if code != 200 {
+		t.Logf("batch response: %s", body)
+		t.Errorf("batch actions failed with %d", code)
 	}
 }
 
-func TestHandleStealthStatus_NoTabs(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-
-	req := httptest.NewRequest("GET", "/stealth/status", nil)
-	w := httptest.NewRecorder()
-
-	h.HandleStealthStatus(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-
-	var resp map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to unmarshal response: %v", err)
-	}
-
-	features, ok := resp["features"].(map[string]interface{})
-	if !ok {
-		t.Error("expected features map")
-	}
-
-	if len(features) == 0 {
-		t.Error("expected non-empty features")
+// A15: Batch empty
+func TestAction_BatchEmpty(t *testing.T) {
+	code, _ := httpPostRaw(t, "/actions", `{"actions": []}`)
+	if code != 400 {
+		t.Errorf("expected 400 for empty batch, got %d", code)
 	}
 }
 
-func TestHandleFingerprintRotate_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
+// A6: Hover
+func TestAction_Hover(t *testing.T) {
+	navigate(t, "https://example.com")
 
-	body := `{"os": "windows", "browser": "chrome"}`
-	req := httptest.NewRequest("POST", "/fingerprint/rotate", bytes.NewReader([]byte(body)))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
+	// Get snapshot to find a link ref
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&format=text&tabId="+currentTabID)
+	s := string(snapBody)
 
-	h.HandleFingerprintRotate(w, req)
+	// Find a link ref
+	ref := findRef(s, "link")
+	if ref == "" {
+		t.Skip("no link ref found in snapshot")
+	}
 
-	if w.Code != 404 {
-		t.Errorf("expected 404 for no tab, got %d", w.Code)
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "hover",
+		"ref":   ref,
+	})
+	if code != 200 {
+		t.Errorf("hover failed with %d", code)
+	}
+
+	closeCurrentTab(t)
+}
+
+// A7: Select
+func TestAction_Select(t *testing.T) {
+	navigate(t, "https://httpbin.org/forms/post")
+	defer closeCurrentTab(t)
+
+	// Get snapshot to find a select element
+	_, snapBody := httpGet(t, "/snapshot?filter=interactive&format=text&tabId="+currentTabID)
+	ref := findRef(string(snapBody), "combobox")
+	if ref == "" {
+		ref = findRef(string(snapBody), "select")
+	}
+	if ref == "" {
+		t.Skip("no select ref found in snapshot")
+	}
+
+	code, _ := httpPost(t, "/action", map[string]any{
+		"tabId": currentTabID,
+		"kind":  "select",
+		"ref":   ref,
+		"value": "opt1",
+	})
+	if code != 200 {
+		t.Errorf("select failed with %d", code)
 	}
 }
 
-func TestHandleAction_GetMissingKind(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("GET", "/action?tabId=tab1", nil)
-	w := httptest.NewRecorder()
+// A13: No tab
+func TestAction_NoTab(t *testing.T) {
+	navigate(t, "https://example.com")
 
-	h.HandleAction(w, req)
-
-	if w.Code != 400 {
-		t.Errorf("expected 400 for missing kind, got %d", w.Code)
-	}
-}
-
-func TestHandleMacro_EmptySteps(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/macro", bytes.NewReader([]byte(`{"tabId":"tab1","steps":[]}`)))
-	w := httptest.NewRecorder()
-	h.HandleMacro(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400 for empty macro steps, got %d", w.Code)
-	}
-}
-
-func TestCountSuccessful(t *testing.T) {
-	results := []actionResult{
-		{Success: true},
-		{Success: false},
-		{Success: true},
-		{Success: true},
-	}
-
-	count := countSuccessful(results)
-	if count != 3 {
-		t.Errorf("expected 3 successful, got %d", count)
-	}
-}
-
-func TestHandleAction_InvalidJSON(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/action", bytes.NewReader([]byte(`not json`)))
-	w := httptest.NewRecorder()
-	h.HandleAction(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+	code, _ := httpPost(t, "/action", map[string]string{
+		"kind":  "click",
+		"ref":   "e0",
+		"tabId": "nonexistent_xyz",
+	})
+	// Should be an error (not 200)
+	if code == 200 {
+		t.Error("expected error for nonexistent tab")
 	}
 }

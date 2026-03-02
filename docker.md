@@ -1,112 +1,81 @@
-# Docker Deployment
+# Pinchtab Docker Test Plan
 
-Pinchtab includes a Docker image with bundled Chromium for easy deployment.
+**Goal:** Validate the Docker image builds, runs, and behaves identically to the native binary.
 
-## Quick Start
+**Prerequisites:** Docker installed, `pinchtab/pinchtab:latest` image available (pull or local build).
 
-### Using Docker Compose
+---
 
-```bash
-# Clone the repository
-git clone https://github.com/pinchtab/pinchtab.git
-cd pinchtab
+## 1. Image Build & Structure
 
-# Start with docker-compose
-docker-compose up -d
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D1 | Build succeeds | `docker build -t pinchtab/pinchtab .` | Exit 0, image created |
+| D2 | Image size reasonable | `docker images pinchtab/pinchtab --format '{{.Size}}'` | < 1GB |
+| D3 | Non-root user | `docker run --rm pinchtab/pinchtab whoami` | `pinchtab` |
+| D4 | Binary present | `docker run --rm pinchtab/pinchtab which pinchtab` | `/usr/local/bin/pinchtab` |
+| D5 | Chromium present | `docker run --rm pinchtab/pinchtab which chromium-browser` | Path returned |
+| D6 | No build artifacts | `docker run --rm pinchtab/pinchtab ls /build 2>&1` | Directory not found |
 
-# Check logs
-docker-compose logs -f
+## 2. Container Startup & Health
 
-# Test
-curl http://localhost:9867/health
-```
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D7 | Default startup | `docker run -d -p 9867:9867 --security-opt seccomp=unconfined pinchtab/pinchtab` | Container starts, stays running |
+| D8 | Health check | `curl http://localhost:9867/health` | 200, `{"status":"ok"}` |
+| D9 | Custom port | `docker run -d -p 8080:8080 -e BRIDGE_PORT=8080 --security-opt seccomp=unconfined pinchtab/pinchtab` | Health on :8080 |
+| D10 | Auth token | `docker run -d -p 9867:9867 -e BRIDGE_TOKEN=secret --security-opt seccomp=unconfined pinchtab/pinchtab` | `/health` without token → 401, with token → 200 |
+| D11 | Graceful stop | `docker stop <container>` | Exit 0, no zombie Chrome processes |
 
-### Using Docker CLI
+## 3. Core Functionality (in container)
 
-```bash
-# Build image
-docker build -t pinchtab .
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D12 | Navigate | `POST /navigate {"url":"https://example.com"}` | 200, title="Example Domain" |
+| D13 | Snapshot | `GET /snapshot?tabId=<id>` | 200, accessibility tree returned |
+| D14 | Text extract | `GET /text?tabId=<id>` | 200, page text content |
+| D15 | Click action | `POST /action {"kind":"click","ref":"e1"}` | 200, action performed |
+| D16 | Multi-tab | Open 3 tabs via `/navigate`, `GET /tabs` | All 3 tabs listed |
 
-# Run container
-docker run -d \
-  --name pinchtab \
-  -p 9867:9867 \
-  -v pinchtab-data:/data \
-  --security-opt seccomp=unconfined \
-  pinchtab
+## 4. Persistence & Volumes
 
-# With auth token
-docker run -d \
-  --name pinchtab \
-  -p 9867:9867 \
-  -v pinchtab-data:/data \
-  -e BRIDGE_TOKEN=your-secret-token \
-  --security-opt seccomp=unconfined \
-  pinchtab
-```
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D17 | State dir mounted | `docker run -v pinchtab-data:/data ...`, navigate + login, stop, restart | Session/cookies persist |
+| D18 | Profile persistence | Same as D17 — Chrome profile in `/data/chrome-profile` | Login state survives restart |
+| D19 | Without volume | Run without `-v`, stop, restart | Clean slate, no state |
 
-## Configuration
+## 5. Docker Compose
 
-Environment variables:
-- `BRIDGE_BIND` - Address to bind to (set to `0.0.0.0` in Docker)
-- `BRIDGE_PORT` - HTTP port (default: 9867)
-- `BRIDGE_TOKEN` - Auth token (optional)
-- `BRIDGE_HEADLESS` - Run Chrome headless (default: true in Docker)
-- `BRIDGE_STATE_DIR` - State directory (default: /data)
-- `BRIDGE_STEALTH` - Stealth level: `light` (default) or `full`
-- `BRIDGE_BLOCK_IMAGES` - Block image loading (default: false)
-- `BRIDGE_BLOCK_MEDIA` - Block all media (default: false)
-- `BRIDGE_NO_ANIMATIONS` - Disable CSS animations (default: false)
-- `CHROME_BINARY` - Set automatically in Docker (`/usr/bin/chromium-browser`)
-- `CHROME_FLAGS` - Set automatically in Docker (`--no-sandbox --disable-gpu`)
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D20 | Compose up | `docker compose up -d` | Container starts, health OK |
+| D21 | Compose with token | `PINCHTAB_TOKEN=secret docker compose up -d` | Auth enforced |
+| D22 | Compose down + up | `docker compose down && docker compose up -d` | Volume persists, clean restart |
+| D23 | SHM size | Check Chrome stability under load (compose sets `shm_size: 2gb`) | No crashes from shared memory exhaustion |
 
-## Architecture
+## 6. Multi-Platform
 
-The Docker image:
-- Uses Alpine Linux for minimal size
-- Includes Chromium browser
-- Runs as non-root user
-- Uses dumb-init for proper signal handling
-- Persists state in `/data` volume
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D24 | AMD64 image | Pull/run on x86_64 host | Works correctly |
+| D25 | ARM64 image | Pull/run on ARM host (e.g. Apple Silicon via Rosetta, Raspberry Pi) | Works correctly |
 
-## Profiles & Dashboard Mode
+## 7. Resource & Security
 
-Docker runs Pinchtab in **bridge mode** — a single headless Chrome instance with one default profile. This is the intended setup for containers.
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D26 | Memory limit | `docker run --memory=512m ...` | Runs (may OOM on heavy pages, but starts OK) |
+| D27 | CPU limit | `docker run --cpus=1 ...` | Runs, slower but functional |
+| D28 | seccomp required | `docker run -d -p 9867:9867 pinchtab/pinchtab` (no seccomp flag) | Chrome may fail to launch — document requirement |
+| D29 | Read-only rootfs | `docker run --read-only -v pinchtab-data:/data ...` | Runs (writes only to /data) |
+| D30 | No privileged | `docker run ...` (without `--privileged`) | Works with seccomp=unconfined, no need for privileged |
 
-The **profile management** feature (dashboard mode, multiple named Chrome profiles) is designed for **desktop/workstation** use where you might manage multiple browser identities from a GUI. It doesn't apply to Docker deployments:
+## 8. Edge Cases
 
-- Containers are ephemeral — profiles don't persist unless you mount `/data`
-- There's no user desktop or personal Chrome to coexist with
-- One container = one browser instance, which is the right model for automation
-
-If you need multiple isolated browser instances, run multiple containers rather than using the dashboard's profile system.
-
-## Security Notes
-
-The container requires `--security-opt seccomp=unconfined` for Chrome to function properly. This is a limitation of running Chrome in containers.
-
-For production use:
-1. Always set `BRIDGE_TOKEN`
-2. Use a reverse proxy with TLS
-3. Limit container resources
-4. Run on isolated networks
-
-## Troubleshooting
-
-### Chrome crashes
-Increase memory limit:
-```yaml
-mem_limit: 4g
-```
-
-### Font issues
-The image includes basic fonts. For specific fonts:
-```dockerfile
-RUN apk add --no-cache ttf-liberation ttf-dejavu
-```
-
-### Performance
-For better performance:
-```yaml
-shm_size: '2gb'  # Shared memory for Chrome
-```
+| # | Scenario | Steps | Expected |
+|---|----------|-------|----------|
+| D31 | Rapid restart | `docker restart <container>` 5 times quickly | No port conflicts, no zombie processes |
+| D32 | OOM kill recovery | Kill Chrome inside container | Pinchtab detects and either restarts Chrome or exits cleanly |
+| D33 | Container logs | `docker logs <container>` | Startup info visible, no sensitive data leaked |
+| D34 | Signal forwarding | `docker kill -s SIGTERM <container>` | dumb-init forwards signal, clean shutdown |

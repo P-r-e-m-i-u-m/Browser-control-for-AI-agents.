@@ -1,99 +1,155 @@
-package handlers
+//go:build integration
+
+package integration
 
 import (
-	"bytes"
 	"encoding/json"
-	"net/http/httptest"
 	"testing"
-
-	"github.com/pinchtab/pinchtab/internal/config"
 )
 
-func TestHandleSetCookies_InvalidJSON(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("POST", "/cookies", bytes.NewReader([]byte(`not json`)))
-	w := httptest.NewRecorder()
-
-	h.HandleSetCookies(w, req)
-
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// C1: Get cookies
+func TestCookies_Get(t *testing.T) {
+	navigate(t, "https://example.com")
+	code, body := httpGet(t, "/cookies?tabId="+currentTabID)
+	if code != 200 {
+		t.Fatalf("expected 200, got %d (body: %s)", code, body)
 	}
-}
 
-func TestHandleSetCookies_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	body := `{"url":"https://example.com","cookies":[{"name":"a","value":"b"}],"tabId":"nonexistent"}`
-	req := httptest.NewRequest("POST", "/cookies", bytes.NewReader([]byte(body)))
-	w := httptest.NewRecorder()
-
-	h.HandleSetCookies(w, req)
-
-	if w.Code != 404 {
-		t.Errorf("expected 404, got %d", w.Code)
-	}
-}
-
-func TestHandleGetCookies_NameFilter(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("GET", "/cookies?name=session_id&tabId=nonexistent", nil)
-	w := httptest.NewRecorder()
-
-	h.HandleGetCookies(w, req)
-
-	if w.Code != 404 {
-		t.Errorf("expected 404, got %d", w.Code)
-	}
 	var resp map[string]any
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("invalid json: %v", err)
 	}
-	if resp["error"] == nil {
-		t.Error("expected error in response")
+
+	// Should have cookies array
+	cookiesRaw := resp["cookies"]
+	cookies, ok := cookiesRaw.([]any)
+	if !ok {
+		t.Fatalf("expected cookies to be an array, got %T", cookiesRaw)
+	}
+
+	// Verify structure of cookies if any exist
+	for _, c := range cookies {
+		cookie, ok := c.(map[string]any)
+		if !ok {
+			t.Errorf("expected cookie to be an object, got %T", c)
+			continue
+		}
+
+		// Check required fields
+		if cookie["name"] == nil {
+			t.Error("expected 'name' field in cookie")
+		}
+		if cookie["value"] == nil {
+			t.Error("expected 'value' field in cookie")
+		}
+		if cookie["domain"] == nil {
+			t.Error("expected 'domain' field in cookie")
+		}
+		if cookie["path"] == nil {
+			t.Error("expected 'path' field in cookie")
+		}
 	}
 }
 
-func TestHandleTabGetCookies_MissingTabID(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("GET", "/tabs//cookies", nil)
-	w := httptest.NewRecorder()
-	h.HandleTabGetCookies(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// C2: Set cookies
+func TestCookies_Set(t *testing.T) {
+	navigate(t, "https://example.com")
+
+	// Set a cookie
+	code, body := httpPost(t, "/cookies", map[string]any{
+		"tabId": currentTabID,
+		"url":   "https://example.com",
+		"cookies": []map[string]any{
+			{
+				"name":  "test_cookie",
+				"value": "test_value",
+				"path":  "/",
+			},
+		},
+	})
+
+	if code != 200 {
+		t.Fatalf("expected 200, got %d (body: %s)", code, body)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+
+	// Check response indicates success
+	setCount, ok := resp["set"].(float64)
+	if !ok || setCount != 1 {
+		t.Errorf("expected 'set' field = 1, got %v", resp["set"])
+	}
+
+	// Verify the cookie was set by getting cookies again
+	code2, body2 := httpGet(t, "/cookies?url=https://example.com&tabId="+currentTabID)
+	if code2 != 200 {
+		t.Fatalf("GET /cookies failed: %d", code2)
+	}
+
+	var getRespBody map[string]any
+	if err := json.Unmarshal(body2, &getRespBody); err != nil {
+		t.Fatalf("invalid json from GET: %v", err)
+	}
+
+	cookiesRaw := getRespBody["cookies"]
+	cookies, ok := cookiesRaw.([]any)
+	if !ok {
+		t.Errorf("expected cookies array, got %T", cookiesRaw)
+	}
+
+	// Look for our cookie
+	found := false
+	for _, c := range cookies {
+		cookie, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cookie["name"] == "test_cookie" && cookie["value"] == "test_value" {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Error("set cookie not found in subsequent GET /cookies")
 	}
 }
 
-func TestHandleTabGetCookies_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	req := httptest.NewRequest("GET", "/tabs/tab_abc/cookies", nil)
-	req.SetPathValue("id", "tab_abc")
-	w := httptest.NewRecorder()
-	h.HandleTabGetCookies(w, req)
-	if w.Code != 404 {
-		t.Errorf("expected 404, got %d", w.Code)
+// C3: Get cookies no tab
+func TestCookies_GetNoTab(t *testing.T) {
+	// Try to get cookies from a non-existent tab
+	code, body := httpGet(t, "/cookies?tabId=nonexistent_tab_12345")
+	if code == 200 {
+		t.Errorf("expected error when getting cookies from non-existent tab, got 200 (body: %s)", body)
 	}
 }
 
-func TestHandleTabSetCookies_TabIDMismatch(t *testing.T) {
-	h := New(&mockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	body := `{"tabId":"tab_other","url":"https://example.com","cookies":[{"name":"a","value":"b"}]}`
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/cookies", bytes.NewReader([]byte(body)))
-	req.SetPathValue("id", "tab_abc")
-	w := httptest.NewRecorder()
-	h.HandleTabSetCookies(w, req)
-	if w.Code != 400 {
-		t.Errorf("expected 400, got %d", w.Code)
+// C4: Set cookies bad JSON
+func TestCookies_SetBadJSON(t *testing.T) {
+	navigate(t, "https://example.com")
+
+	code, body := httpPostRaw(t, "/cookies", "{broken")
+	if code != 400 {
+		t.Errorf("expected 400 for bad JSON, got %d (body: %s)", code, body)
 	}
 }
 
-func TestHandleTabSetCookies_NoTab(t *testing.T) {
-	h := New(&failMockBridge{}, &config.RuntimeConfig{}, nil, nil, nil)
-	body := `{"url":"https://example.com","cookies":[{"name":"a","value":"b"}]}`
-	req := httptest.NewRequest("POST", "/tabs/tab_abc/cookies", bytes.NewReader([]byte(body)))
-	req.SetPathValue("id", "tab_abc")
-	w := httptest.NewRecorder()
-	h.HandleTabSetCookies(w, req)
-	if w.Code != 404 {
-		t.Errorf("expected 404, got %d", w.Code)
+// C5: Set cookies empty
+func TestCookies_SetEmpty(t *testing.T) {
+	navigate(t, "https://example.com")
+
+	// Post with empty cookies array
+	code, body := httpPost(t, "/cookies", map[string]any{
+		"tabId":   currentTabID,
+		"url":     "https://example.com",
+		"cookies": []map[string]any{},
+	})
+
+	// The handler returns 400 for empty cookies array
+	if code != 400 {
+		t.Errorf("expected 400 for empty cookies array, got %d (body: %s)", code, body)
 	}
 }
