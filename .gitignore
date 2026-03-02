@@ -1,0 +1,29 @@
+node_modules/
+browser-bridge
+/pinchtab
+coverage.out
+
+# Build artifacts
+dist/
+*.js
+!scripts/**/*.js
+!npm/bin/pinchtab
+!internal/dashboard/dashboard/*.js
+
+# npm package
+npm/node_modules/
+# package-lock.json is committed for reproducible installs via npm ci
+
+# OpenClaw workspace files (should never be committed)
+.openclaw/
+SOUL.md
+HEARTBEAT.md
+IDENTITY.md
+USER.md
+BOOTSTRAP.md
+TOOLS.md
+MEMORY.md
+.openclaw/
+AGENTS.md
+*.test
+memory/
